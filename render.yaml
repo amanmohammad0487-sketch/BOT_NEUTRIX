@@ -1,6 +1,7 @@
 services:
-  - type: worker
-    name: admin-inbox-bot
+  - type: web
+    name: bot-neutrix
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 bot:app
