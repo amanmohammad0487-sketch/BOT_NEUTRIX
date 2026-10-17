@@ -2,36 +2,46 @@
 import os
 import json
 import shlex
-import getpass
 import threading
+import secrets
 from datetime import datetime
-
+from flask import Flask, request, abort
 import telebot
-from telebot import types
 
 ADMIN_ID = 8829161471
 DATA_FILE = "users.json"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+
 OFFLINE_MESSAGE = (
-    "Sorry, The owner is offline just leave message what you want "
-    "he will see and reply"
+    "Sorry, The owner is offline just leave message "
+    "what you want he will see and reply"
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    TOKEN = getpass.getpass("Enter BotFather token (hidden): ").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable missing")
 
-bot = telebot.TeleBot(TOKEN)
-lock = threading.Lock()
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET environment variable missing")
+
+if not PUBLIC_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL environment variable missing")
+
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
+
+lock = threading.RLock()
 owner_online = True
 
 
 def load_users():
-    if not os.path.exists(DATA_FILE):
-        return {}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 
@@ -40,56 +50,109 @@ users = load_users()
 
 def save_users():
     with lock:
-        temp_file = DATA_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
+        temp = DATA_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, DATA_FILE)
+        os.replace(temp, DATA_FILE)
 
 
 def get_name(user):
     name = " ".join(
-        part for part in [user.first_name, user.last_name] if part
+        x for x in [user.first_name, user.last_name] if x
     )
     return name or "Unknown"
 
 
 def register_user(user):
     uid = str(user.id)
-    if uid not in users:
-        numbers = [
-            int(info["label"].split("_")[1])
-            for info in users.values()
-            if info.get("label", "").startswith("USER_")
-            and info["label"].split("_")[1].isdigit()
-        ]
-        label = f"USER_{max(numbers, default=0) + 1}"
-        users[uid] = {"label": label}
 
-    users[uid]["name"] = get_name(user)
-    users[uid]["username"] = user.username or ""
-    users[uid]["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_users()
-    return users[uid]["label"]
+    with lock:
+        info = users.get(uid, {})
 
+        if not info.get("label"):
+            numbers = [
+                int(item["label"].split("_")[1])
+                for item in users.values()
+                if item.get("label", "").startswith("USER_")
+                and item["label"].split("_")[1].isdigit()
+            ]
+            info["label"] = f"USER_{max(numbers, default=0) + 1}"
 
-def user_details(user, message_text):
-    label = register_user(user)
-    username = f"@{user.username}" if user.username else "Not set"
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info["name"] = get_name(user)
+        info["username"] = user.username or ""
+        info["last_seen"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        users[uid] = info
+        save_users()
 
-    return (
-        f"📩 New message received\n\n"
-        f"User: {label}\n"
-        f"Name: {get_name(user)}\n"
-        f"Username: {username}\n"
-        f"User ID: {user.id}\n"
-        f"Time: {now}\n"
-        f"Message: {message_text or '[media or other content]'}"
-    )
+    return info["label"]
 
 
 def is_admin(message):
-    return message.from_user and message.from_user.id == ADMIN_ID
+    return (
+        message.from_user is not None
+        and message.from_user.id == ADMIN_ID
+    )
+
+
+def send_user_info(message):
+    user = message.from_user
+    label = register_user(user)
+    username = f"@{user.username}" if user.username else "Not set"
+    text = message.text or message.caption or "[Media / attachment]"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    details = (
+        f"📩 New message\n\n"
+        f"{label}\n"
+        f"Name - {get_name(user)}\n"
+        f"Username - {username}\n"
+        f"User ID - {user.id}\n"
+        f"Time - {now}\n"
+        f"Messaged - {text}"
+    )
+
+    bot.send_message(ADMIN_ID, details)
+
+    if message.content_type != "text":
+        bot.copy_message(
+            ADMIN_ID, message.chat.id, message.message_id
+        )
+
+
+def send_offline_reply(chat_id):
+    if not owner_online:
+        bot.send_message(chat_id, OFFLINE_MESSAGE)
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "BOT_NEUTRIX is running", 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok"}, 200
+
+
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    if not secrets.compare_digest(
+        request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token", ""
+        ),
+        WEBHOOK_SECRET
+    ):
+        abort(403)
+
+    data = request.get_json(silent=True)
+    if not data:
+        abort(400)
+
+    update = telebot.types.Update.de_json(data)
+    bot.process_new_updates([update])
+    return "OK", 200
 
 
 @bot.message_handler(commands=["start"])
@@ -97,24 +160,22 @@ def start_command(message):
     if is_admin(message):
         bot.reply_to(
             message,
-            "Admin panel ready.\n"
-            "/online - mark owner online\n"
-            "/offline - mark owner offline\n"
-            '/message "Your message" "username or name or ID"\n'
-            "/users - list registered users"
+            "BOT_NEUTRIX Admin Panel\n\n"
+            "/online - Owner online\n"
+            "/offline - Owner offline\n"
+            '/message "Your message" "@username"\n'
+            "/users - Registered users"
         )
         return
 
     register_user(message.from_user)
-    bot.reply_to(message, "Hello! Your message can be sent to the owner.")
-    bot.send_message(ADMIN_ID, user_details(message.from_user, "/start"))
-
-    if not owner_online:
-        bot.send_message(message.chat.id, OFFLINE_MESSAGE)
+    bot.reply_to(message, "Hello! Leave your message here.")
+    send_user_info(message)
+    send_offline_reply(message.chat.id)
 
 
 @bot.message_handler(commands=["online", "offline"])
-def set_status(message):
+def status_command(message):
     global owner_online
 
     if not is_admin(message):
@@ -126,20 +187,27 @@ def set_status(message):
 
 
 @bot.message_handler(commands=["users"])
-def list_users(message):
+def users_command(message):
     if not is_admin(message):
         return
 
-    if not users:
+    with lock:
+        entries = list(users.items())
+
+    if not entries:
         bot.reply_to(message, "No registered users yet.")
         return
 
     lines = ["Registered users:"]
-    for uid, info in users.items():
-        username = f"@{info['username']}" if info.get("username") else "No username"
+    for uid, info in entries:
+        username = (
+            "@" + info["username"]
+            if info.get("username") else "No username"
+        )
         lines.append(
-            f"{info.get('label', 'USER')} | {info.get('name', 'Unknown')} "
-            f"| {username} | ID: {uid}"
+            f'{info.get("label", "USER")} | '
+            f'{info.get("name", "Unknown")} | '
+            f'{username} | ID: {uid}'
         )
 
     output = "\n".join(lines)
@@ -148,7 +216,7 @@ def list_users(message):
 
 
 @bot.message_handler(commands=["message"])
-def send_private_message(message):
+def message_command(message):
     if not is_admin(message):
         return
 
@@ -161,95 +229,86 @@ def send_private_message(message):
         target = " ".join(parts[2:]).strip()
         if not text_to_send or not target:
             raise ValueError
-
     except ValueError:
         bot.reply_to(
             message,
-            'Usage:\n/message "Hello there" "@username"\n'
-            'Or:\n/message "Hello there" "USER_1"\n'
-            'You can also use a registered user ID.'
+            'Usage: /message "Hello" "@username"\n'
+            'Or: /message "Hello" "USER_1"\n'
+            'Or use the numeric Telegram user ID.'
         )
         return
 
     target_lower = target.lstrip("@").casefold()
-    matches = []
 
-    for uid, info in users.items():
-        username = info.get("username", "").casefold()
-        name = info.get("name", "").casefold()
-        label = info.get("label", "").casefold()
+    with lock:
+        matches = []
+        for uid, info in users.items():
+            username = info.get("username", "").casefold()
+            name = info.get("name", "").casefold()
+            label = info.get("label", "").casefold()
 
-        if (
-            uid == target
-            or label == target_lower
-            or (username and username == target_lower)
-            or name == target.casefold()
-        ):
-            matches.append(uid)
+            if (
+                uid == target
+                or label == target_lower
+                or (username and username == target_lower)
+                or name == target.casefold()
+            ):
+                matches.append(uid)
 
     if len(matches) == 0:
         bot.reply_to(
             message,
             "User not found. They must start the bot first. "
-            "Try /users to check registered users."
+            "Use /users to check saved users."
         )
         return
 
     if len(matches) > 1:
         bot.reply_to(
             message,
-            "More than one user has that name. Use their numeric Telegram ID."
+            "Duplicate name found. Use the user's numeric ID."
         )
         return
 
     try:
         bot.send_message(int(matches[0]), text_to_send)
-        bot.reply_to(message, "Message delivered successfully.")
-    except Exception as exc:
+        bot.reply_to(message, "Message sent successfully.")
+    except Exception:
         bot.reply_to(
             message,
-            f"Could not deliver the message: {type(exc).__name__}. "
-            "The user may have blocked the bot."
+            "Could not send message. The user may have blocked the bot."
         )
 
 
 @bot.message_handler(
-    func=lambda m: bool(m.from_user)
-    and m.from_user.id != ADMIN_ID
-    and not (m.text or "").startswith("/")
-    ,
     content_types=[
-        "text", "photo", "video", "document", "audio", "voice",
-        "video_note", "animation", "sticker", "location", "contact"
+        "text", "photo", "video", "document", "audio",
+        "voice", "video_note", "animation", "sticker",
+        "location", "contact"
     ]
 )
-def receive_user_message(message):
+def incoming_message(message):
+    if is_admin(message):
+        return
+
+    if message.content_type == "text" and message.text.startswith("/"):
+        return
+
     register_user(message.from_user)
 
-    text_content = message.text or message.caption or ""
-    details = user_details(message.from_user, text_content)
-
     try:
-        bot.send_message(ADMIN_ID, details)
-        bot.copy_message(
-            chat_id=ADMIN_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id
-        )
-    except Exception:
-        try:
-            bot.send_message(
-                ADMIN_ID,
-                "Could not copy the original message. "
-                "Check the bot's permissions and supported message type."
-            )
-        except Exception:
-            pass
+        send_user_info(message)
+    except Exception as exc:
+        print("Forward error:", type(exc).__name__)
 
-    if not owner_online:
-        bot.send_message(message.chat.id, OFFLINE_MESSAGE)
+    send_offline_reply(message.chat.id)
 
 
-print("Admin Inbox Bot is running...")
-bot.infinity_polling(skip_pending=True)
+# Register webhook when Gunicorn imports this module.
+bot.set_webhook(
+    url=PUBLIC_URL + "/telegram-webhook",
+    secret_token=WEBHOOK_SECRET,
+    allowed_updates=["message"]
+)
 
+print("BOT_NEUTRIX webhook configured.")
