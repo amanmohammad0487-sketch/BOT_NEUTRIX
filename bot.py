@@ -301,7 +301,11 @@ def incoming_message(message):
     except Exception as exc:
         print("Forward error:", type(exc).__name__)
 
-    send_offline_reply(message.chat.id)
+    bot.reply_to(message, "Message received. The owner will review it.")
+bot.reply_to(message, "Message received. The owner will review it.")
+bot.reply_to(message, "Message received. The owner will review it.")
+bot.reply_to(message, "Message received. The owner will review it.")
+send_offline_reply(message.chat.id)
 
 
 # Register webhook when Gunicorn imports this module.
